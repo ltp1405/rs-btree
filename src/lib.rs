@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::{mem::{swap, take}, fmt::Display};
+
 trait BtreeNode {
     fn should_split(&self) -> bool;
     fn insert<K: PartialOrd, V>(&mut self, key: &K, val: &V);
@@ -8,8 +10,10 @@ trait BtreeNode {
 type Key = u32;
 type InteriorVal = (Key, Box<SimpleNode>);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub enum SimpleNode {
+    #[default]
+    None,
     Interior {
         vals: Vec<InteriorVal>,
         left_child: Option<Box<SimpleNode>>,
@@ -39,49 +43,60 @@ pub enum Slot {
     Cell(u32),
 }
 
-fn interior_node_insert(mut node: Box<SimpleNode>, val: InteriorVal) -> LeafInsertResult {
-    let slot = node.search(val.0);
-    let hole = match slot {
-        Slot::Hole(h) => h,
-        Slot::Cell(c) => panic!(),
-    };
-    match *node {
-        SimpleNode::Interior {
-            ref mut vals,
-            ref mut left_child,
-        } => {
-            vals.insert(hole as usize, val);
-            if node.overflow() {
-                let (k, l, r) = node_split(node);
-                return LeafInsertResult::Splitted(k, l, r);
-            }
-            LeafInsertResult::Normal(node)
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn leaf_node_insert(mut node: Box<SimpleNode>, key: u32) -> LeafInsertResult {
+fn node_insert(mut node: Box<SimpleNode>, key: u32) -> LeafInsertResult {
     let slot = node.search(key);
     let hole = match slot {
         Slot::Hole(h) => h,
-        Slot::Cell(c) => panic!(),
+        Slot::Cell(c) => todo!(),
     };
-    match *node {
+    let node: Box<SimpleNode> = match *node {
         SimpleNode::Leaf { ref mut vals } => {
             vals.insert(hole as usize, key);
-            if node.overflow() {
-                let (k, l, r) = node_split(node);
-                return LeafInsertResult::Splitted(k, l, r);
-            }
-            LeafInsertResult::Normal(node)
+            node
         }
-        _ => unreachable!(),
+        SimpleNode::Interior {
+            mut vals,
+            mut left_child,
+        } => {
+            match vals.get_mut(hole as usize) {
+                Some(val) => {
+                    let val = take(val);
+                    let val_key = val.0;
+                    let (split, val) = match node_insert(val.1, key) {
+                        LeafInsertResult::Normal(node) => (None, node),
+                        LeafInsertResult::Splitted(k, l, r) => (Some((k, l)), r),
+                    };
+                    swap(&mut (val_key, val), &mut vals[hole as usize]);
+                    if let Some(v) = split {
+                        vals.insert(hole as usize, v);
+                    }
+                }
+                None => {
+                    let val = left_child.take().unwrap();
+                    let (split, val) = match node_insert(val, key) {
+                        LeafInsertResult::Normal(node) => (None, node),
+                        LeafInsertResult::Splitted(k, l, r) => (Some((k, l)), r),
+                    };
+                    let _ = left_child.insert(val);
+                    if let Some(v) = split {
+                        vals.push(v);
+                    }
+                }
+            }
+            Box::new(SimpleNode::Interior { vals, left_child })
+        }
+        SimpleNode::None => unreachable!(),
+    };
+    if node.overflow() {
+        let (k, l, r) = node_split(node);
+        return LeafInsertResult::Splitted(k, l, r);
     }
+    LeafInsertResult::Normal(node)
 }
 
 fn node_split(node: Box<SimpleNode>) -> (Key, Box<SimpleNode>, Box<SimpleNode>) {
     match *node {
+        SimpleNode::None => unreachable!(),
         SimpleNode::Leaf { vals } => {
             let (l, r) = split_in_half(vals);
             let mid_key = r.first().unwrap().clone();
@@ -162,6 +177,7 @@ impl SimpleNode {
                 Ok(_) => return true,
                 Err(_) => return false,
             },
+            _ => unreachable!(),
         }
     }
 
@@ -169,12 +185,14 @@ impl SimpleNode {
         let len = match self {
             Self::Interior { vals, left_child } => vals.len(),
             Self::Leaf { vals } => vals.len(),
+            _ => unreachable!(),
         };
         len > 3
     }
 
     fn keys(&self) -> Vec<u32> {
         match self {
+            SimpleNode::None => unreachable!(),
             Self::Leaf { vals } => vals.iter().map(|e| *e).collect(),
             Self::Interior {
                 vals,
@@ -212,9 +230,35 @@ impl SimpleNode {
     }
 }
 
+#[derive(Debug)]
+struct Btree {
+    root: Box<SimpleNode>,
+}
+
+impl Btree {
+    pub fn new() -> Self {
+        Self {
+            root: Box::new(SimpleNode::Leaf { vals: vec![] }),
+        }
+    }
+
+    pub fn insert(&mut self, key: Key) {
+        let root = take(&mut self.root);
+        self.root = match node_insert(root, key) {
+            LeafInsertResult::Normal(node) => node,
+            LeafInsertResult::Splitted(k, l, r) => Box::new(SimpleNode::Interior {
+                vals: vec![(k, l)],
+                left_child: Some(r),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{leaf_node_insert, node_split, LeafInsertResult};
+    use std::mem::{swap, take};
+
+    use crate::{node_insert, node_split, Btree, LeafInsertResult};
 
     use super::SimpleNode;
 
@@ -222,7 +266,7 @@ mod tests {
         let leaf1 = Box::new(SimpleNode::Leaf { vals: vec![12] });
         let leaf2 = Box::new(SimpleNode::Leaf { vals: vec![98] });
         let leaf3 = Box::new(SimpleNode::Leaf {
-            vals: vec![101, 123],
+            vals: vec![101, 123, 145, 221],
         });
         let leaf4 = Box::new(SimpleNode::Leaf { vals: vec![332] });
         let leaf5 = Box::new(SimpleNode::Leaf {
@@ -230,7 +274,7 @@ mod tests {
         });
 
         let root = Box::new(SimpleNode::Interior {
-            vals: vec![(43, leaf1), (100, leaf2), (124, leaf3), (3532, leaf4)],
+            vals: vec![(43, leaf1), (100, leaf2), (600, leaf3), (3532, leaf4)],
             left_child: Some(leaf5),
         });
         root
@@ -266,19 +310,33 @@ mod tests {
 
     #[test]
     fn simple_insert_2() {
-        let root = tree_sample_2();
+        let mut root = tree_sample_2();
+        println!("{:#?}", root);
+        let root = node_insert(root, 123);
+        println!("==================================");
+        println!("{:#?}", root);
 
-        let rs = match *root {
-            SimpleNode::Leaf { vals } => unreachable!(),
-            SimpleNode::Interior { vals, left_child } => {
-                vals = {
-                    leaf_node_insert(vals[2].1, 12);
-                    vals
-                }
-            }
-        };
+        let root = tree_sample_1();
+        println!("{:#?}", root);
+        let root = node_insert(root, 1232);
+        println!("{:#?}", root);
+        panic!()
+    }
 
-        println!("{:?}", root);
+    #[test]
+    fn insert_3() {
+        let mut tree = Btree::new();
+        tree.insert(12);
+        tree.insert(142);
+        tree.insert(523);
+        tree.insert(1242);
+        tree.insert(242);
+        tree.insert(123);
+        tree.insert(9999);
+        tree.insert(7777);
+        tree.insert(7778);
+        tree.insert(7779);
+        println!("{:#?}", tree);
         panic!()
     }
 
@@ -286,19 +344,19 @@ mod tests {
     fn simple_insert_till_overflow() {
         let root = Box::new(SimpleNode::Leaf { vals: Vec::new() });
 
-        let root = match leaf_node_insert(root, 1124) {
+        let root = match node_insert(root, 1124) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
-        let root = match leaf_node_insert(root, 12) {
+        let root = match node_insert(root, 12) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
-        let root = match leaf_node_insert(root, 43) {
+        let root = match node_insert(root, 43) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
-        let root = match leaf_node_insert(root, 12332) {
+        let root = match node_insert(root, 12332) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
@@ -315,15 +373,15 @@ mod tests {
     fn simple_insert() {
         let root = Box::new(SimpleNode::Leaf { vals: Vec::new() });
 
-        let root = match leaf_node_insert(root, 1124) {
+        let root = match node_insert(root, 1124) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
-        let root = match leaf_node_insert(root, 12) {
+        let root = match node_insert(root, 12) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
-        let root = match leaf_node_insert(root, 43) {
+        let root = match node_insert(root, 43) {
             LeafInsertResult::Normal(n) => n,
             LeafInsertResult::Splitted(_, _, _) => unreachable!(),
         };
